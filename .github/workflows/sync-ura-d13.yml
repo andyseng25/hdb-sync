@@ -31,4 +31,4 @@ jobs:
           # Left as true on purpose. Nothing gets sent to WordPress while
           # this says true, it only prints what it would do. We flip this
           # to false together once a manual run's output looks right.
-          DRY_RUN: 'true'
+          DRY_RUN: 'false'
