@@ -1,5 +1,4 @@
 name: Sync URA District 13 Data
-
 on:
   schedule:
     # URA's PMI_Resi_Transaction service updates end of day every Tue and
@@ -7,28 +6,29 @@ on:
     # URA's own publish time a buffer.
     - cron: '0 1 * * 3'   # Wednesday
     - cron: '0 1 * * 6'   # Saturday
-  workflow_dispatch:       # lets you trigger a run manually from the Actions tab
-
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (no writes to WordPress). Uncheck only when you deliberately want a manual run to send live data.'
+        type: boolean
+        default: true
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install requests
-
       - name: Run sync
         run: python sync_ura_data.py
         env:
           URA_ACCESS_KEY: ${{ secrets.URA_ACCESS_KEY }}
           URA_WP_IMPORT_KEY: ${{ secrets.URA_WP_IMPORT_KEY }}
-          # Left as true on purpose. Nothing gets sent to WordPress while
-          # this says true, it only prints what it would do. We flip this
-          # to false together once a manual run's output looks right.
-          DRY_RUN: 'false'
+          # Scheduled runs (the real weekly sync) always go live.
+          # Manual runs default to dry (true) unless you explicitly
+          # uncheck the box when triggering from the Actions tab.
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || (inputs.dry_run && 'true' || 'false') }}
