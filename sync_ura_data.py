@@ -257,8 +257,19 @@ def main():
     all_projects = fetch_all(token)
     print(f"Total project entries returned: {len(all_projects)}")
 
-    print("\nRaw shape of one project entry, for inspecting field names:")
-    print(json.dumps(all_projects[0], indent=2))
+    print("\nAll project entries with street containing 'ALJUNIED', District 13 transactions only:")
+    aljunied_entries = [
+        p for p in all_projects
+        if 'ALJUNIED' in p.get('street', '').upper()
+        and any(t.get('district') == TARGET_DISTRICT for t in p.get('transaction', []))
+    ]
+    print(f"{len(aljunied_entries)} distinct project entries found.")
+    for p in aljunied_entries:
+        d13_txns = [t for t in p.get('transaction', []) if t.get('district') == TARGET_DISTRICT]
+        print(f"\n  project={p.get('project')!r}  street={p.get('street')!r}  "
+              f"{len(d13_txns)} D13 transaction(s) in this entry:")
+        for t in d13_txns:
+            print(f"    {t.get('contractDate')}  ${t.get('price')}  {t.get('area')} sqm  {t.get('typeOfSale')}")
 
     records = filter_and_enrich(all_projects)
     landed = [r for r in records if r["category"] == "landed"]
