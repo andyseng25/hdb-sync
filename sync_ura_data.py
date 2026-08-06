@@ -8,21 +8,13 @@ Sends to the standalone "URA District 13 Private Property" plugin, not the
 HDB plugin. Different endpoint, different secret, no shared code between
 the two on the WordPress side.
 
-URA's PMI_Resi_Transaction service covers landed AND non-landed private
-residential in one feed, split by the propertyType field. This script
-pulls everything, keeps only district == "13", classifies each row as
-"condo" or "landed", computes PSF, and pushes new rows over. Already-known
-rows are silently skipped by the endpoint (via a hash-based unique key),
-so re-sending the full 60 month window on every run is safe.
-
-Two differences from the HDB pipeline that matter:
-1. Auth is two step. URA_ACCESS_KEY is permanent, but every run has to
-   trade it in for a fresh daily Token before calling the data service.
-2. URA gives no per-record unique ID like HDB's _id. The dedup key here
-   is a hash of the fields that together make a transaction unique. On
-   a high volume project with several identical unit types sold in the
-   same month, this could theoretically collide and under-count by one.
-   That's an accepted, disclosed limitation, not a silent bug.
+v2 note: switched TOKEN_URL and DATA_URL to the older www.ura.gov.sg
+pattern after the first live run failed against eservice.ura.gov.sg's v1
+endpoint with a non-JSON response. This older pattern is the one used by
+a real, working open source implementation, not just documentation text.
+get_token() and fetch_batch() now print the raw response on any failure
+instead of letting a bare JSONDecodeError hide what URA's server actually
+sent back, so if this also fails, the next run tells us why.
 
 Reads secrets from environment variables, set as GitHub Actions secrets.
 Never hardcode keys in this file.
@@ -33,8 +25,8 @@ import json
 import hashlib
 import requests
 
-TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
-DATA_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
+TOKEN_URL = "https://www.ura.gov.sg/uraDataService/insertNewToken.action"
+DATA_URL = "https://www.ura.gov.sg/uraDataService/invokeUraDS"
 SITE_URL = "https://andyseng.me"
 IMPORT_ENDPOINT = f"{SITE_URL}/wp-json/ura/v1/import"
 
@@ -59,11 +51,38 @@ SALE_TYPE_LABELS = {
 }
 
 
+def _debug_body(response, label):
+    """Print enough of a failed response to diagnose it, without ever
+    printing the AccessKey or Token we sent, only what came back."""
+    print(f"{label} status code: {response.status_code}")
+    body = response.text or "(empty body)"
+    print(f"{label} response body (first 500 chars):\n{body[:500]}")
+
+
 def get_token():
     headers = {"AccessKey": URA_ACCESS_KEY}
     response = requests.get(TOKEN_URL, headers=headers, timeout=30)
-    response.raise_for_status()
-    data = response.json()
+
+    if response.status_code != 200:
+        _debug_body(response, "Token request")
+        raise RuntimeError(
+            f"Token request returned HTTP {response.status_code}, see body above. "
+            "A 4xx here usually means the AccessKey itself is wrong or has "
+            "stray whitespace from being pasted into GitHub secrets."
+        )
+
+    try:
+        data = response.json()
+    except ValueError:
+        _debug_body(response, "Token request")
+        raise RuntimeError(
+            "Token endpoint returned HTTP 200 but the body wasn't JSON. "
+            "If the body above looks like an HTML page, that's URA's server "
+            "blocking or redirecting the request rather than answering it, "
+            "not a problem with your key. If the body is empty, same idea, "
+            "something between us and URA swallowed the real response."
+        )
+
     if data.get("Status") != "Success":
         raise RuntimeError(f"Token request failed: {data}")
     return data["Result"]
@@ -73,10 +92,21 @@ def fetch_batch(batch_num, token):
     headers = {"AccessKey": URA_ACCESS_KEY, "Token": token}
     params = {"service": "PMI_Resi_Transaction", "batch": batch_num}
     response = requests.get(DATA_URL, params=params, headers=headers, timeout=60)
-    response.raise_for_status()
-    data = response.json()
-    if data.get("Status") != "Success":
+
+    if response.status_code != 200:
+        _debug_body(response, f"Batch {batch_num} request")
         return None
+
+    try:
+        data = response.json()
+    except ValueError:
+        _debug_body(response, f"Batch {batch_num} request")
+        return None
+
+    if data.get("Status") != "Success":
+        print(f"  Batch {batch_num}: API reported failure: {data}")
+        return None
+
     return data.get("Result", [])
 
 
@@ -199,6 +229,7 @@ def send_batch(records):
 def main():
     print("Fetching daily token...")
     token = get_token()
+    print("Token received.")
 
     print("Fetching URA private residential transactions...")
     all_projects = fetch_all(token)
