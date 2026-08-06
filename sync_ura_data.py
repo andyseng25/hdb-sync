@@ -8,18 +8,21 @@ Sends to the standalone "URA District 13 Private Property" plugin, not the
 HDB plugin. Different endpoint, different secret, no shared code between
 the two on the WordPress side.
 
-Endpoint history, so the next person (probably still you) doesn't repeat
-this troubleshooting from scratch:
-  v1: eservice.ura.gov.sg/.../v1  -> non-JSON response, undiagnosed at the time
-  v2: www.ura.gov.sg/.../.action  -> clean HTTP 403, CloudFront block page
-  v3: same www.ura.gov.sg URL, added browser headers -> HTTP 404, and the
-      body was an Isomer-templated page (GovTech's standard gov.sg website
-      builder), meaning www.ura.gov.sg has been rebuilt as URA's general
-      public website and the old API path no longer exists there at all.
-  v4 (this version): back to eservice.ura.gov.sg, the subdomain actually
-      meant for URA's interactive e-services and APIs, now with the same
-      diagnostics and browser headers so a failure here is finally readable
-      instead of another guess.
+v5 note: the first live import stored 2,553 of 2,636 records, 83 skipped
+as "already known" by the dedup key, on the very first run, when the
+table started empty. That means those 83 weren't stale re-sends, the
+dedup key found them identical to something else in the very same pull.
+71 of the 83 are landed, only 12 are condo, a 22x rate difference, too
+lopsided to be random. report_collisions() below prints exactly which
+records share a hash so we can see with our own eyes whether these are
+genuinely different transactions being wrongly merged (a real gap in
+what free URA data can disambiguate for standalone landed houses) or the
+same transaction legitimately appearing twice in URA's own feed (the
+dedup key working correctly). No fix is applied yet, this version only
+adds visibility. Endpoint history for anyone picking this up fresh:
+eservice.ura.gov.sg is the correct host, www.ura.gov.sg's old API path
+is dead (migrated to a general Isomer-built site), and both auth calls
+need browser-style headers, see earlier commit history for why.
 
 Reads secrets from environment variables, set as GitHub Actions secrets.
 Never hardcode keys in this file.
@@ -29,6 +32,7 @@ import os
 import json
 import hashlib
 import requests
+from collections import defaultdict
 
 TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
 DATA_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
@@ -38,13 +42,11 @@ IMPORT_ENDPOINT = f"{SITE_URL}/wp-json/ura/v1/import"
 URA_ACCESS_KEY = os.environ["URA_ACCESS_KEY"]
 URA_WP_IMPORT_KEY = os.environ["URA_WP_IMPORT_KEY"]
 
-# Defaults to dry (safe) if not set. The workflow file controls this
-# explicitly, see sync-ura-d13.yml.
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 
 TARGET_DISTRICT = "13"
-MAX_BATCHES = 6          # safety cap, see fetch_all() for why this isn't hardcoded to a fixed count
-BATCH_SIZE = 300         # records sent to WordPress per request, matches the HDB script
+MAX_BATCHES = 6
+BATCH_SIZE = 300
 SQM_TO_SQFT = 10.7639
 
 LANDED_KEYWORDS = ("terrace", "semi-detached", "detached", "bungalow")
@@ -64,8 +66,6 @@ BROWSER_HEADERS = {
 
 
 def _debug_body(response, label):
-    """Print enough of a failed response to diagnose it, without ever
-    printing the AccessKey or Token we sent, only what came back."""
     print(f"{label} status code: {response.status_code}")
     body = response.text or "(empty body)"
     print(f"{label} response body (first 500 chars):\n{body[:500]}")
@@ -74,22 +74,14 @@ def _debug_body(response, label):
 def get_token():
     headers = {**BROWSER_HEADERS, "AccessKey": URA_ACCESS_KEY}
     response = requests.get(TOKEN_URL, headers=headers, timeout=30)
-
     if response.status_code != 200:
         _debug_body(response, "Token request")
-        raise RuntimeError(
-            f"Token request returned HTTP {response.status_code}, see body above."
-        )
-
+        raise RuntimeError(f"Token request returned HTTP {response.status_code}, see body above.")
     try:
         data = response.json()
     except ValueError:
         _debug_body(response, "Token request")
-        raise RuntimeError(
-            "Token endpoint returned HTTP 200 but the body wasn't JSON. "
-            "See the printed body above for what it actually sent."
-        )
-
+        raise RuntimeError("Token endpoint returned HTTP 200 but the body wasn't JSON.")
     if data.get("Status") != "Success":
         raise RuntimeError(f"Token request failed: {data}")
     return data["Result"]
@@ -99,33 +91,21 @@ def fetch_batch(batch_num, token):
     headers = {**BROWSER_HEADERS, "AccessKey": URA_ACCESS_KEY, "Token": token}
     params = {"service": "PMI_Resi_Transaction", "batch": batch_num}
     response = requests.get(DATA_URL, params=params, headers=headers, timeout=60)
-
     if response.status_code != 200:
         _debug_body(response, f"Batch {batch_num} request")
         return None
-
     try:
         data = response.json()
     except ValueError:
         _debug_body(response, f"Batch {batch_num} request")
         return None
-
     if data.get("Status") != "Success":
         print(f"  Batch {batch_num}: API reported failure: {data}")
         return None
-
     return data.get("Result", [])
 
 
 def fetch_all(token):
-    """
-    URA splits the 60 month transaction history across a small number of
-    batches, but the documented example only ever shows batch=1, the
-    actual count isn't stated anywhere public. Rather than hardcode a
-    guess, keep asking for the next batch number until one comes back
-    empty or errors, capped at MAX_BATCHES so a bad response can't loop
-    forever.
-    """
     all_projects = []
     for batch_num in range(1, MAX_BATCHES + 1):
         result = fetch_batch(batch_num, token)
@@ -145,8 +125,6 @@ def classify_category(property_type):
 
 
 def parse_contract_date(text):
-    # Format is MMYY, e.g. "0715" -> July 2015. All URA data covers 2015
-    # onward, so a fixed "20xx" prefix is safe here.
     month = int(text[0:2])
     year = 2000 + int(text[2:4])
     return f"{year:04d}-{month:02d}"
@@ -214,8 +192,6 @@ def filter_and_enrich(all_projects):
                 continue
             records.append(enrich(project_entry, txn))
 
-    # Safety check, belt and suspenders: confirm the filter actually
-    # worked, don't trust it blindly. Same philosophy as sync_hdb_data.py.
     for r in records:
         if r["district"] != TARGET_DISTRICT:
             raise RuntimeError(
@@ -224,6 +200,35 @@ def filter_and_enrich(all_projects):
             )
 
     return records
+
+
+def report_collisions(records):
+    """
+    Groups records by dedup hash and prints any group with more than one
+    record. Purely diagnostic, changes nothing about what gets sent.
+    """
+    groups = defaultdict(list)
+    for r in records:
+        groups[r["txn_hash"]].append(r)
+
+    collisions = {h: rs for h, rs in groups.items() if len(rs) > 1}
+    if not collisions:
+        print("\nNo hash collisions in this pull. Every record has a unique key.")
+        return
+
+    dropped = sum(len(rs) - 1 for rs in collisions.values())
+    landed_dropped = sum(len(rs) - 1 for rs in collisions.values() if rs[0]["category"] == "landed")
+    condo_dropped = dropped - landed_dropped
+    print(f"\n{len(collisions)} hash groups share a key "
+          f"({dropped} records would be treated as duplicates: "
+          f"{landed_dropped} landed, {condo_dropped} condo).")
+    print("First 8 groups, so we can see if these look like the same sale twice "
+          "or two different sales that happen to share every field we can see:")
+    for h, rs in list(collisions.items())[:8]:
+        print(f"\n  Hash {h[:12]}... ({len(rs)} records):")
+        for r in rs:
+            print(f"    {r['category']:<7} {r['street']:<28} {r['area_sqm']:>7.1f} sqm  "
+                  f"${r['price']:>13,.0f}  {r['contract_date']}  {r['type_of_sale']}")
 
 
 def send_batch(records):
@@ -248,13 +253,10 @@ def main():
     print(f"District 13 transactions: {len(records)} "
           f"({len(condo)} condo/apartment, {len(landed)} landed)")
 
+    report_collisions(records)
+
     if DRY_RUN:
-        print("\nDRY RUN, nothing sent. Sample records:")
-        for r in records[:5]:
-            print(f"  {r['contract_date']}  {(r['project'] or r['street']):<30} "
-                  f"{r['property_type']:<20} ${r['price']:,.0f}  {r['psf']:.0f} psf")
-        print(f"\n{len(records)} records would be sent to WordPress. "
-              "Set DRY_RUN to false in the workflow file once this looks right.")
+        print("\nDRY RUN, nothing sent.")
         return
 
     total_inserted = 0
