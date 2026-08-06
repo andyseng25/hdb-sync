@@ -8,15 +8,18 @@ Sends to the standalone "URA District 13 Private Property" plugin, not the
 HDB plugin. Different endpoint, different secret, no shared code between
 the two on the WordPress side.
 
-v3 note: the first live run against eservice.ura.gov.sg/v1 returned a
-non-JSON response. Switching to the older www.ura.gov.sg endpoint got a
-clean HTTP 403 with a CloudFront "request blocked" page, meaning an edge
-layer in front of URA is filtering the request before it reaches URA's
-own service, most likely on request fingerprint (default Python UA) or
-origin IP (GitHub's cloud ranges), not the AccessKey itself. This version
-sends realistic browser headers to test the fingerprint theory first,
-since it's the cheaper thing to rule out before assuming a geography
-block that would need a different fix entirely.
+Endpoint history, so the next person (probably still you) doesn't repeat
+this troubleshooting from scratch:
+  v1: eservice.ura.gov.sg/.../v1  -> non-JSON response, undiagnosed at the time
+  v2: www.ura.gov.sg/.../.action  -> clean HTTP 403, CloudFront block page
+  v3: same www.ura.gov.sg URL, added browser headers -> HTTP 404, and the
+      body was an Isomer-templated page (GovTech's standard gov.sg website
+      builder), meaning www.ura.gov.sg has been rebuilt as URA's general
+      public website and the old API path no longer exists there at all.
+  v4 (this version): back to eservice.ura.gov.sg, the subdomain actually
+      meant for URA's interactive e-services and APIs, now with the same
+      diagnostics and browser headers so a failure here is finally readable
+      instead of another guess.
 
 Reads secrets from environment variables, set as GitHub Actions secrets.
 Never hardcode keys in this file.
@@ -27,8 +30,8 @@ import json
 import hashlib
 import requests
 
-TOKEN_URL = "https://www.ura.gov.sg/uraDataService/insertNewToken.action"
-DATA_URL = "https://www.ura.gov.sg/uraDataService/invokeUraDS"
+TOKEN_URL = "https://eservice.ura.gov.sg/uraDataService/insertNewToken/v1"
+DATA_URL = "https://eservice.ura.gov.sg/uraDataService/invokeUraDS/v1"
 SITE_URL = "https://andyseng.me"
 IMPORT_ENDPOINT = f"{SITE_URL}/wp-json/ura/v1/import"
 
@@ -52,8 +55,6 @@ SALE_TYPE_LABELS = {
     "3": "Resale",
 }
 
-# Default python-requests UA is an easy, common bot-filter trigger,
-# separate from any IP/geography question. Testing that first.
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -77,10 +78,7 @@ def get_token():
     if response.status_code != 200:
         _debug_body(response, "Token request")
         raise RuntimeError(
-            f"Token request returned HTTP {response.status_code}, see body above. "
-            "If the body looks like a CloudFront/WAF block page rather than "
-            "anything mentioning your key, this is an edge block, not a bad "
-            "AccessKey, and needs a different fix (see chat)."
+            f"Token request returned HTTP {response.status_code}, see body above."
         )
 
     try:
