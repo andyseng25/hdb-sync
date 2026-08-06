@@ -34,8 +34,16 @@ that named estates span multiple real streets under one project and the
 per-transaction street lives somewhere in txn instead. Not fixed yet,
 need to see the real JSON shape first.
 
-Reads secrets from environment variables, set as GitHub Actions secrets.
-Never hardcode keys in this file.
+v7 note: manual cross-check against URA's own web portal (eservice
+search UI) confirms Sennett Estate D13 landed transactions actually sit
+on many different real streets (Macpherson Road, Wan Tho Avenue, Kee
+Choe Avenue, Upper Aljunied Road, and others), not just Upper Aljunied
+Road. The earlier diagnostic filtered on street containing 'ALJUNIED',
+which by construction can only ever find entries whose street field
+already says Aljunied, so it could not have told us whether Sennett
+Estate is one API project entry or several. This version fixes that by
+filtering on project name instead, to settle it properly. Still no
+change to enrich(), still diagnostic-only, still DRY_RUN gated.
 """
 
 import os
@@ -55,6 +63,7 @@ URA_WP_IMPORT_KEY = os.environ["URA_WP_IMPORT_KEY"]
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
 
 TARGET_DISTRICT = "13"
+DIAGNOSTIC_PROJECT_NAME = "SENNETT ESTATE"  # v7: match on project, not street
 MAX_BATCHES = 6
 BATCH_SIZE = 300
 SQM_TO_SQFT = 10.7639
@@ -257,14 +266,19 @@ def main():
     all_projects = fetch_all(token)
     print(f"Total project entries returned: {len(all_projects)}")
 
-    print("\nAll project entries with street containing 'ALJUNIED', District 13 transactions only:")
-    aljunied_entries = [
+    # v7: match on project name, not street name. The old street-based
+    # filter could only ever find entries whose street field already said
+    # 'ALJUNIED', so it was structurally incapable of answering whether
+    # Sennett Estate is one API project entry or several. This settles it.
+    print(f"\nAll project entries where project name = '{DIAGNOSTIC_PROJECT_NAME}', "
+          f"District {TARGET_DISTRICT} transactions only:")
+    estate_entries = [
         p for p in all_projects
-        if 'ALJUNIED' in p.get('street', '').upper()
+        if p.get('project', '').upper() == DIAGNOSTIC_PROJECT_NAME
         and any(t.get('district') == TARGET_DISTRICT for t in p.get('transaction', []))
     ]
-    print(f"{len(aljunied_entries)} distinct project entries found.")
-    for p in aljunied_entries:
+    print(f"{len(estate_entries)} distinct project entries found.")
+    for p in estate_entries:
         d13_txns = [t for t in p.get('transaction', []) if t.get('district') == TARGET_DISTRICT]
         print(f"\n  project={p.get('project')!r}  street={p.get('street')!r}  "
               f"{len(d13_txns)} D13 transaction(s) in this entry:")
