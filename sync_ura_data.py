@@ -24,6 +24,16 @@ eservice.ura.gov.sg is the correct host, www.ura.gov.sg's old API path
 is dead (migrated to a general Isomer-built site), and both auth calls
 need browser-style headers, see earlier commit history for why.
 
+v6 note: diagnostic-only change, one print statement added to main() to
+dump a raw project entry and inspect its actual field names before
+touching enrich(). See the ongoing thread on why street looks wrong for
+named-estate landed transactions (Sennett Estate, MacPherson Garden
+Estate, Braddell Heights Estate) specifically. enrich() currently reads
+street from project_entry, not from the individual txn, on the theory
+that named estates span multiple real streets under one project and the
+per-transaction street lives somewhere in txn instead. Not fixed yet,
+need to see the real JSON shape first.
+
 Reads secrets from environment variables, set as GitHub Actions secrets.
 Never hardcode keys in this file.
 """
@@ -247,10 +257,13 @@ def main():
     all_projects = fetch_all(token)
     print(f"Total project entries returned: {len(all_projects)}")
 
+    print("\nRaw shape of one project entry, for inspecting field names:")
+    print(json.dumps(all_projects[0], indent=2))
+
     records = filter_and_enrich(all_projects)
     landed = [r for r in records if r["category"] == "landed"]
     condo = [r for r in records if r["category"] == "condo"]
-    print(f"District 13 transactions: {len(records)} "
+    print(f"\nDistrict 13 transactions: {len(records)} "
           f"({len(condo)} condo/apartment, {len(landed)} landed)")
 
     report_collisions(records)
