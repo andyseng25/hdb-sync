@@ -8,13 +8,15 @@ Sends to the standalone "URA District 13 Private Property" plugin, not the
 HDB plugin. Different endpoint, different secret, no shared code between
 the two on the WordPress side.
 
-v2 note: switched TOKEN_URL and DATA_URL to the older www.ura.gov.sg
-pattern after the first live run failed against eservice.ura.gov.sg's v1
-endpoint with a non-JSON response. This older pattern is the one used by
-a real, working open source implementation, not just documentation text.
-get_token() and fetch_batch() now print the raw response on any failure
-instead of letting a bare JSONDecodeError hide what URA's server actually
-sent back, so if this also fails, the next run tells us why.
+v3 note: the first live run against eservice.ura.gov.sg/v1 returned a
+non-JSON response. Switching to the older www.ura.gov.sg endpoint got a
+clean HTTP 403 with a CloudFront "request blocked" page, meaning an edge
+layer in front of URA is filtering the request before it reaches URA's
+own service, most likely on request fingerprint (default Python UA) or
+origin IP (GitHub's cloud ranges), not the AccessKey itself. This version
+sends realistic browser headers to test the fingerprint theory first,
+since it's the cheaper thing to rule out before assuming a geography
+block that would need a different fix entirely.
 
 Reads secrets from environment variables, set as GitHub Actions secrets.
 Never hardcode keys in this file.
@@ -50,6 +52,15 @@ SALE_TYPE_LABELS = {
     "3": "Resale",
 }
 
+# Default python-requests UA is an easy, common bot-filter trigger,
+# separate from any IP/geography question. Testing that first.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-SG,en;q=0.9",
+}
+
 
 def _debug_body(response, label):
     """Print enough of a failed response to diagnose it, without ever
@@ -60,15 +71,16 @@ def _debug_body(response, label):
 
 
 def get_token():
-    headers = {"AccessKey": URA_ACCESS_KEY}
+    headers = {**BROWSER_HEADERS, "AccessKey": URA_ACCESS_KEY}
     response = requests.get(TOKEN_URL, headers=headers, timeout=30)
 
     if response.status_code != 200:
         _debug_body(response, "Token request")
         raise RuntimeError(
             f"Token request returned HTTP {response.status_code}, see body above. "
-            "A 4xx here usually means the AccessKey itself is wrong or has "
-            "stray whitespace from being pasted into GitHub secrets."
+            "If the body looks like a CloudFront/WAF block page rather than "
+            "anything mentioning your key, this is an edge block, not a bad "
+            "AccessKey, and needs a different fix (see chat)."
         )
 
     try:
@@ -77,10 +89,7 @@ def get_token():
         _debug_body(response, "Token request")
         raise RuntimeError(
             "Token endpoint returned HTTP 200 but the body wasn't JSON. "
-            "If the body above looks like an HTML page, that's URA's server "
-            "blocking or redirecting the request rather than answering it, "
-            "not a problem with your key. If the body is empty, same idea, "
-            "something between us and URA swallowed the real response."
+            "See the printed body above for what it actually sent."
         )
 
     if data.get("Status") != "Success":
@@ -89,7 +98,7 @@ def get_token():
 
 
 def fetch_batch(batch_num, token):
-    headers = {"AccessKey": URA_ACCESS_KEY, "Token": token}
+    headers = {**BROWSER_HEADERS, "AccessKey": URA_ACCESS_KEY, "Token": token}
     params = {"service": "PMI_Resi_Transaction", "batch": batch_num}
     response = requests.get(DATA_URL, params=params, headers=headers, timeout=60)
 
