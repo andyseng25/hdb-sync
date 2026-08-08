@@ -4,8 +4,8 @@ on:
     # URA's PMI_Resi_Transaction service updates end of day every Tue and
     # Fri. These run the morning after, 09:00 SGT (01:00 UTC), to give
     # URA's own publish time a buffer.
-    - cron: '0 1 * * 3'   # Wednesday
-    - cron: '0 1 * * 6'   # Saturday
+    - cron: '7 1 * * 3'   # Wednesday
+    - cron: '7 1 * * 6'   # Saturday
   workflow_dispatch:
     inputs:
       dry_run:
