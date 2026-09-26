@@ -43,7 +43,7 @@ MONTHS_TO_CHECK = 3   # re-check the last N months to catch late registrations
 # rebuild the whole table since Jan 2017, then set back to False and
 # commit again. Leaving it True makes every scheduled run a slow full
 # re-import (harmless, no duplicates, but wasteful).
-FULL_RESYNC = True
+FULL_RESYNC = False
 FIRST_MONTH = "2017-01"
 BATCH_SIZE = 300      # records sent to WordPress per request, avoids PHP timeouts
 SQM_TO_SQFT = 10.7639
