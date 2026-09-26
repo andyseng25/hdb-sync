@@ -25,4 +25,4 @@ jobs:
         env:
           DATA_GOV_API_KEY: ${{ secrets.DATA_GOV_API_KEY }}
           WP_IMPORT_KEY: ${{ secrets.WP_IMPORT_KEY }}
-        run: python sync_hdb_data.py
+        run: python -u sync_hdb_data.py
