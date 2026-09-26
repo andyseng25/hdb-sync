@@ -5,9 +5,17 @@ Checks the last few months of HDB resale data (to catch transactions
 that register late, after their month was first published), computes
 PSF and remaining lease in months, and pushes any new records to the
 secured WordPress endpoint. Already-known records are silently
-skipped by the endpoint itself (via the unique api_id key), so
+skipped by the endpoint itself (via the unique fingerprint key), so
 re-checking recent months on every run is always safe, never creates
 duplicates.
+
+v2 (26 Sep 2026): dedup key changed from data.gov.sg's _id to a
+fingerprint of the deal's own details. The _id is only a row number
+and gets reassigned when data.gov.sg reloads its sorted table, which
+caused new deals to be skipped as "duplicates" (e.g. the $1.701M and
+$1.72M Pinnacle@Duxton deals landed on IDs already held by old
+Aljunied Cres deals). Identical twin deals in the same month get a
+running counter (#1, #2) so neither is dropped.
 
 Reads secrets from environment variables, set as GitHub Actions
 secrets. Never hardcode keys in this file.
@@ -15,7 +23,10 @@ secrets. Never hardcode keys in this file.
 
 import os
 import json
+import time
+import hashlib
 import requests
+from collections import defaultdict
 from datetime import datetime, timezone
 
 DATASET_ID = "d_8b84c4ee58e3cfc0ece0d773c8ca6abc"
@@ -26,6 +37,13 @@ DATA_GOV_API_KEY = os.environ["DATA_GOV_API_KEY"]
 WP_IMPORT_KEY = os.environ["WP_IMPORT_KEY"]
 
 MONTHS_TO_CHECK = 3   # re-check the last N months to catch late registrations
+
+# ONE-TIME USE: set to True, commit, run the workflow manually once to
+# rebuild the whole table since Jan 2017, then set back to False and
+# commit again. Leaving it True makes every scheduled run a slow full
+# re-import (harmless, no duplicates, but wasteful).
+FULL_RESYNC = True
+FIRST_MONTH = "2017-01"
 BATCH_SIZE = 300      # records sent to WordPress per request, avoids PHP timeouts
 SQM_TO_SQFT = 10.7639
 
@@ -40,6 +58,19 @@ def recent_months(n):
         if month == 0:
             month = 12
             year -= 1
+    return months
+
+
+def all_months_since(first):
+    months = []
+    year, month = int(first[:4]), int(first[5:7])
+    today = datetime.now(timezone.utc)
+    while (year, month) <= (today.year, today.month):
+        months.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
     return months
 
 
@@ -68,7 +99,14 @@ def fetch_month(month_str):
             "offset": offset,
             "filters": filters,
         }
-        response = requests.get(API_URL, params=params, headers=headers, timeout=30)
+        response = None
+        for attempt in range(5):
+            response = requests.get(API_URL, params=params, headers=headers, timeout=30)
+            if response.status_code != 429:
+                break
+            wait = 10 * (attempt + 1)
+            print(f"    Rate limited by data.gov.sg, waiting {wait}s...")
+            time.sleep(wait)
         response.raise_for_status()
         data = response.json()
         if not data.get("success"):
@@ -92,6 +130,38 @@ def fetch_month(month_str):
     return records
 
 
+def base_key(record):
+    """The deal's own details, normalised so formatting quirks
+    (e.g. "107.00" vs "107.0") can't make one deal look like two."""
+    return "|".join([
+        record["month"].strip(),
+        record["town"].strip().upper(),
+        record["flat_type"].strip().upper(),
+        record["block"].strip().upper(),
+        record["street_name"].strip().upper(),
+        record["storey_range"].strip().upper(),
+        f"{float(record['floor_area_sqm']):.2f}",
+        record["flat_model"].strip().upper(),
+        str(int(float(record["lease_commence_date"]))),
+        record["remaining_lease"].strip().lower(),
+        f"{float(record['resale_price']):.2f}",
+    ])
+
+
+def add_fingerprints(records):
+    """Fingerprint = sha256 of the deal's details plus a running count,
+    so two genuinely identical deals in the same month stay separate.
+    Must be called on a FULL month of records, which fetch_month returns."""
+    seen = defaultdict(int)
+    for r in records:
+        key = base_key(r)
+        seen[key] += 1
+        r["_fingerprint"] = hashlib.sha256(
+            f"{key}#{seen[key]}".encode("utf-8")
+        ).hexdigest()
+    return records
+
+
 def enrich(record):
     floor_area_sqm = float(record["floor_area_sqm"])
     resale_price = float(record["resale_price"])
@@ -99,6 +169,7 @@ def enrich(record):
     lease_months = parse_lease_to_months(record["remaining_lease"])
 
     return {
+        "fingerprint": record["_fingerprint"],
         "api_id": int(record["_id"]),
         "month": record["month"],
         "town": record["town"],
@@ -125,14 +196,20 @@ def send_batch(records):
 
 
 def main():
-    months = recent_months(MONTHS_TO_CHECK)
-    print(f"Checking months: {', '.join(months)}")
+    if FULL_RESYNC:
+        months = all_months_since(FIRST_MONTH)
+        print(f"FULL RESYNC: {len(months)} months, {months[0]} to {months[-1]}")
+    else:
+        months = recent_months(MONTHS_TO_CHECK)
+        print(f"Checking months: {', '.join(months)}")
 
     all_records = []
     for month_str in months:
-        records = fetch_month(month_str)
+        records = add_fingerprints(fetch_month(month_str))
         print(f"  {month_str}: {len(records)} records from API")
         all_records.extend(records)
+        if FULL_RESYNC:
+            time.sleep(1)  # be polite to data.gov.sg on the big run
 
     enriched = [enrich(r) for r in all_records]
 
