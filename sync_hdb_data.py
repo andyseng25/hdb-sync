@@ -22,6 +22,7 @@ secrets. Never hardcode keys in this file.
 """
 
 import os
+import sys
 import json
 import time
 import hashlib
@@ -195,6 +196,40 @@ def send_batch(records):
     return response.json()
 
 
+def fetch_db_counts():
+    url = f"{SITE_URL}/wp-json/hdb/v1/counts"
+    headers = {"x-hdb-import-key": WP_IMPORT_KEY}
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def verify(api_counts):
+    """Compare what data.gov.sg has against what WordPress holds, for
+    every month this run covered. Fails the whole run (red X in GitHub,
+    email alert) if any month is short, so a gap can never go unnoticed."""
+    db_counts = fetch_db_counts()
+    missing, extra = [], []
+    for month, api_n in api_counts.items():
+        db_n = db_counts.get(month, 0)
+        if db_n < api_n:
+            missing.append((month, api_n, db_n))
+        elif db_n > api_n:
+            extra.append((month, api_n, db_n))
+
+    print(f"\nVERIFY: checked {len(api_counts)} months against WordPress.")
+    for month, api_n, db_n in extra:
+        print(f"  NOTE {month}: API {api_n}, site {db_n} "
+              f"(site has {db_n - api_n} more, likely an HDB correction)")
+    if missing:
+        for month, api_n, db_n in missing:
+            print(f"  MISSING {month}: API {api_n}, site {db_n} "
+                  f"({api_n - db_n} deals short)")
+        print("VERIFY FAILED. Re-run the workflow; missing deals will be added.")
+        sys.exit(1)
+    print("VERIFY PASSED. Every month on the site matches data.gov.sg.")
+
+
 def main():
     if FULL_RESYNC:
         months = all_months_since(FIRST_MONTH)
@@ -204,9 +239,11 @@ def main():
         print(f"Checking months: {', '.join(months)}")
 
     all_records = []
+    api_counts = {}
     for month_str in months:
         records = add_fingerprints(fetch_month(month_str))
         print(f"  {month_str}: {len(records)} records from API")
+        api_counts[month_str] = len(records)
         all_records.extend(records)
         if FULL_RESYNC:
             time.sleep(1)  # be polite to data.gov.sg on the big run
@@ -229,6 +266,14 @@ def main():
 
     if total_inserted == 0:
         print("No new transactions found. Normal between HDB's monthly releases.")
+
+    # Guard: every month we meant to cover must have been fetched.
+    not_fetched = [m for m in months if m not in api_counts]
+    if not_fetched:
+        print(f"FETCH GAP: these months were never fetched: {not_fetched}")
+        sys.exit(1)
+
+    verify(api_counts)
 
 
 if __name__ == "__main__":
